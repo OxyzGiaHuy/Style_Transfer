@@ -7,6 +7,8 @@ import gdown
 import time
 import shutil
 import contextlib
+import tempfile
+import traceback
 from .utils import DEVICE, IMSIZE, tensor_to_pil # Import necessary utils
 
 # Define constants within this module
@@ -25,7 +27,7 @@ STYTR_TRANSFORMER_WEIGHTS_PATH = os.path.join(STYTR_EXPERIMENTS_DIR, "transforme
 
 # Flag to ensure setup runs only once per session if needed
 stytr_initialized = False
-stytr_model_instance = None # To hold the loaded model
+stytr_model_instance = None # Will store the callable inference function
 _StyTR_model_func = None
 _stytr_process_images = None
 
@@ -126,58 +128,75 @@ def setup_stytr_code():
         st.info("StyTR code directory not found. Downloading...")
         progress_bar = st.progress(0, text="Downloading StyTR code...")
         cleanup_zip()
-        temp_extract_dir = "_temp_stytr_extract" # Define here for cleanup scope
+        temp_extract_dir = "_temp_stytr_extract"
         try:
-            gdown.download(id=STYTR_CODE_GDRIVE_ID, output=STYTR_ZIP_PATH, quiet=False)
-            if not os.path.exists(STYTR_ZIP_PATH):
-                 raise FileNotFoundError(f"gdown failed to download {STYTR_ZIP_PATH}")
-
-            progress_bar.progress(20, text="Unzipping StyTR code...")
-            if os.path.exists(temp_extract_dir):
-                shutil.rmtree(temp_extract_dir)
-
-            with zipfile.ZipFile(STYTR_ZIP_PATH, 'r') as zip_ref:
-                zip_ref.extractall(temp_extract_dir)
-
-            extracted_folder_name = find_extracted_code_folder(temp_extract_dir)
-            if not extracted_folder_name:
-                raise NotADirectoryError(f"Could not find expected StyTR code folder within {temp_extract_dir}. Check zip structure.")
-
-            source_folder_path = os.path.join(temp_extract_dir, extracted_folder_name)
-
-            if os.path.exists(STYTR_DIR):
-                st.warning(f"Removing existing '{STYTR_DIR}' directory before replacing.")
-                shutil.rmtree(STYTR_DIR)
-
-            shutil.move(source_folder_path, STYTR_DIR)
-            shutil.rmtree(temp_extract_dir)
-            cleanup_zip()
-
-            progress_bar.progress(40, text="Creating experiments directory...")
-            os.makedirs(STYTR_EXPERIMENTS_DIR, exist_ok=True)
-            progress_bar.empty()
-            st.info("StyTR code downloaded and extracted.")
+            if not download_and_extract_stytr_code(progress_bar, temp_extract_dir):
+                return False
+            setup_experiments_directory(progress_bar)
             return True
-
         except Exception as e:
-            st.error(f"Error during StyTR code download/unzip: {e}")
-            cleanup_zip()
-            if os.path.exists(temp_extract_dir):
-                 shutil.rmtree(temp_extract_dir)
-            if 'progress_bar' in locals(): progress_bar.empty()
+            handle_setup_error(e, temp_extract_dir, progress_bar)
             return False
     else:
-        os.makedirs(STYTR_EXPERIMENTS_DIR, exist_ok=True)
+        setup_experiments_directory()
         st.info("StyTR code directory already exists.")
         return True
 
+def download_and_extract_stytr_code(progress_bar, temp_extract_dir):
+    """Downloads and extracts the StyTR code."""
+    gdown.download(id=STYTR_CODE_GDRIVE_ID, output=STYTR_ZIP_PATH, quiet=False)
+    if not os.path.exists(STYTR_ZIP_PATH):
+        raise FileNotFoundError(f"gdown failed to download {STYTR_ZIP_PATH}")
+
+    progress_bar.progress(20, text="Unzipping StyTR code...")
+    if os.path.exists(temp_extract_dir):
+        shutil.rmtree(temp_extract_dir)
+
+    with zipfile.ZipFile(STYTR_ZIP_PATH, 'r') as zip_ref:
+        zip_ref.extractall(temp_extract_dir)
+
+    extracted_folder_name = find_extracted_code_folder(temp_extract_dir)
+    if not extracted_folder_name:
+        raise NotADirectoryError(f"Could not find expected StyTR code folder within {temp_extract_dir}. Check zip structure.")
+
+    move_extracted_code(temp_extract_dir, extracted_folder_name)
+    cleanup_zip()
+    return True
+
+def move_extracted_code(temp_extract_dir, extracted_folder_name):
+    """Moves the extracted StyTR code to the target directory."""
+    source_folder_path = os.path.join(temp_extract_dir, extracted_folder_name)
+
+    if os.path.exists(STYTR_DIR):
+        st.warning(f"Removing existing '{STYTR_DIR}' directory before replacing.")
+        shutil.rmtree(STYTR_DIR)
+
+    shutil.move(source_folder_path, STYTR_DIR)
+    shutil.rmtree(temp_extract_dir)
+
+def setup_experiments_directory(progress_bar=None):
+    """Creates the experiments directory."""
+    if progress_bar:
+        progress_bar.progress(40, text="Creating experiments directory...")
+    os.makedirs(STYTR_EXPERIMENTS_DIR, exist_ok=True)
+    if progress_bar:
+        progress_bar.empty()
+
+def handle_setup_error(exception, temp_extract_dir, progress_bar):
+    """Handles errors during the StyTR setup process."""
+    st.error(f"Error during StyTR code download/unzip: {exception}")
+    cleanup_zip()
+    if os.path.exists(temp_extract_dir):
+        shutil.rmtree(temp_extract_dir)
+    if progress_bar:
+        progress_bar.empty()
+
 def setup_stytr_weights():
     """Handles downloading the StyTR weights. Returns True on success."""
-    # Corrected paths based on updated IDs
     weights_to_check = {
-        "VGG": (STYTR_VGG_WEIGHTS_ID, STYTR_VGG_WEIGHTS_PATH),             # vgg_normalised.pth
-        "Embedding": (STYTR_EMBEDDING_WEIGHTS_ID, STYTR_EMBEDDING_WEIGHTS_PATH), # embedding_iter_160000.pth
-        "Transformer": (STYTR_TRANSFORMER_WEIGHTS_ID, STYTR_TRANSFORMER_WEIGHTS_PATH), # transformer_iter_160000.pth
+        "VGG": (STYTR_VGG_WEIGHTS_ID, STYTR_VGG_WEIGHTS_PATH),
+        "Embedding": (STYTR_EMBEDDING_WEIGHTS_ID, STYTR_EMBEDDING_WEIGHTS_PATH),
+        "Transformer": (STYTR_TRANSFORMER_WEIGHTS_ID, STYTR_TRANSFORMER_WEIGHTS_PATH),
     }
     missing_weights = {name: path for name, (_, path) in weights_to_check.items() if not os.path.exists(path)}
 
@@ -188,27 +207,33 @@ def setup_stytr_weights():
     st.info(f"Missing StyTR weights: {', '.join(missing_weights.keys())}. Downloading...")
     progress_bar = st.progress(0, text="Downloading weights...")
     total_weights = len(missing_weights)
-    downloaded_count = 0
 
-    for name, (gdown_id, file_path) in weights_to_check.items():
+    for index, (name, (gdown_id, file_path)) in enumerate(weights_to_check.items()):
         if name in missing_weights:
-            progress_bar.progress(int(downloaded_count / total_weights * 100), text=f"Downloading {name} weights...")
-            try:
-                if os.path.exists(file_path): os.remove(file_path)
-                gdown.download(id=gdown_id, output=file_path, quiet=False)
-                if not os.path.exists(file_path):
-                     raise FileNotFoundError(f"gdown failed to download {name} weights to {file_path}")
-                downloaded_count += 1
-            except Exception as e:
-                st.error(f"Error downloading {name} weights (ID: {gdown_id}): {e}")
-                if os.path.exists(file_path): os.remove(file_path)
-                progress_bar.empty()
+            if not download_weight(name, gdown_id, file_path, progress_bar, index, total_weights):
                 return False
 
     progress_bar.progress(100, text="StyTR weights download complete.")
     time.sleep(1)
     progress_bar.empty()
     return True
+
+def download_weight(name, gdown_id, file_path, progress_bar, index, total_weights):
+    """Downloads a single weight file."""
+    progress_bar.progress(int(index / total_weights * 100), text=f"Downloading {name} weights...")
+    try:
+        if os.path.exists(file_path):
+            os.remove(file_path)
+        gdown.download(id=gdown_id, output=file_path, quiet=False)
+        if not os.path.exists(file_path):
+            raise FileNotFoundError(f"gdown failed to download {name} weights to {file_path}")
+        return True
+    except Exception as e:
+        st.error(f"Error downloading {name} weights (ID: {gdown_id}): {e}")
+        if os.path.exists(file_path):
+            os.remove(file_path)
+        progress_bar.empty()
+        return False
 
 def find_extracted_code_folder(base_dir):
     """Finds the main StyTR code folder within the extracted directory."""
@@ -240,73 +265,78 @@ def load_stytr_model():
         return stytr_model_instance
 
     if not stytr_initialized:
-         st.error("StyTR setup did not complete successfully. Cannot load model.")
-         st.stop()
+        st.error("StyTR setup did not complete successfully. Cannot load model.")
+        st.stop()
 
     if _StyTR_model_func is None:
-         st.error("StyTR network function reference is missing. Import failed during setup.")
-         st.stop()
+        st.error("StyTR network function reference is missing. Import failed during setup.")
+        st.stop()
 
     st.info("Loading StyTR model weights...")
-    try:
-        # --- Ensure CWD is correct during model init if it loads files internally ---
-        # Although the import worked, the __init__ of the network might also load files
-        stytr_dir_abs = os.path.abspath(STYTR_DIR)
-        with change_cwd(stytr_dir_abs):
-            model = _StyTR_model_func() # Call the imported function
-            model.to(DEVICE)
-            model.eval()
-        # --- CWD restored ---
+    # --- CRITICAL CHANGE ---
+    # Assume _StyTR_model_func *is* the callable function returned by network().
+    # Do NOT treat it as an nn.Module instance here.
+    # Store the function itself.
+    inference_function = _StyTR_model_func
+    stytr_model_instance = inference_function # Store the function
 
-        stytr_model_instance = model
-        st.info("StyTR model loaded.")
-        return model
-    except FileNotFoundError as e:
-        st.error(f"StyTR weight file not found during model loading: {e}. "
-                 f"Expected locations within '{STYTR_DIR}/experiments'. ")
-        st.stop()
-    except Exception as e:
-        st.error(f"Error loading StyTR model: {e}")
-        import traceback
-        st.error(traceback.format_exc())
-        st.stop()
+    # We don't call .to(DEVICE) or .eval() on the function itself.
+    # We rely on the setup within utils.py (triggered by import)
+    # to have placed the *internal* model components (vgg, embedding, transformer)
+    # onto the correct device and set them to eval mode.
+
+    return inference_function
+
 
 def run_stytr_inference(content_file_bytes, style_file_bytes):
-    """Runs StyTR inference, handling temporary files."""
+    """Runs StyTR inference, handling temporary files safely."""
     if not stytr_initialized or _stytr_process_images is None:
         st.error("StyTR is not initialized properly. Cannot run inference.")
         return None
 
-    model = load_stytr_model()
+    model = load_stytr_model() # Get the callable inference function
     if model is None:
         return None
 
-    temp_content_path = "temp_content_stytr.jpg"
-    temp_style_path = "temp_style_stytr.jpg"
+    content_temp_file = None
+    style_temp_file = None
     output_img = None
 
     try:
-        with open(temp_content_path, "wb") as f: f.write(content_file_bytes)
-        with open(temp_style_path, "wb") as f: f.write(style_file_bytes)
+        # Create temporary files in the default location or original CWD
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".jpg") as content_tf:
+            content_tf.write(content_file_bytes)
+            content_temp_file = content_tf.name # Get the absolute path
+
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".jpg") as style_tf:
+            style_tf.write(style_file_bytes)
+            style_temp_file = style_tf.name # Get the absolute path
 
         st.info("Processing images for StyTR...")
-        # --- Ensure CWD is correct for process_images if it loads files ---
-        stytr_dir_abs = os.path.abspath(STYTR_DIR)
-        with change_cwd(stytr_dir_abs):
-            content_tensor_stytr, style_tensor_stytr = _stytr_process_images(
-                # Pass paths relative to the *new* CWD (StyTR dir) or absolute paths
-                os.path.abspath(temp_content_path),
-                os.path.abspath(temp_style_path),
-                device=DEVICE,
-                img_size=IMSIZE
-            )
-        # --- CWD restored ---
+        # --- REMOVE change_cwd context for this call ---
+        # We assume _stytr_process_images can handle absolute paths correctly
+        # without CWD being specifically the StyTR directory.
+        abs_content_path = os.path.abspath(content_temp_file)
+        abs_style_path = os.path.abspath(style_temp_file)
+
+        content_tensor_stytr, style_tensor_stytr = _stytr_process_images(
+            abs_content_path,
+            abs_style_path
+            # No img_size, no device arguments
+        )
+        # --- CWD was NOT changed for the above call ---
+
+        # Manually move tensors to device after processing
+        content_tensor_stytr = content_tensor_stytr.to(DEVICE)
+        style_tensor_stytr = style_tensor_stytr.to(DEVICE)
+        st.info(f"Processed tensors moved to device: {DEVICE}")
 
         st.info("Running StyTR model inference...")
         with torch.no_grad():
-            # Model inference itself usually doesn't depend on CWD
+            # Model inference should work regardless of CWD
             output_stytr = model(content_tensor_stytr, style_tensor_stytr)
 
+        # Convert output tensor to PIL image
         if isinstance(output_stytr, (list, tuple)):
             output_tensor = output_stytr[0].cpu()
         else:
@@ -316,11 +346,19 @@ def run_stytr_inference(content_file_bytes, style_file_bytes):
 
     except Exception as e:
         st.error(f"Error during Transformer Style Transfer inference: {e}")
-        import traceback
-        st.error(traceback.format_exc())
+        st.error(traceback.format_exc()) # Ensure traceback is printed
         output_img = None
     finally:
-        if os.path.exists(temp_content_path): os.remove(temp_content_path)
-        if os.path.exists(temp_style_path): os.remove(temp_style_path)
+        # Clean up temporary files
+        if content_temp_file and os.path.exists(content_temp_file):
+            try:
+                os.remove(content_temp_file)
+            except OSError as e:
+                 st.warning(f"Could not remove temp file {content_temp_file}: {e}")
+        if style_temp_file and os.path.exists(style_temp_file):
+             try:
+                os.remove(style_temp_file)
+             except OSError as e:
+                 st.warning(f"Could not remove temp file {style_temp_file}: {e}")
 
     return output_img
