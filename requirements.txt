@@ -1,0 +1,5 @@
+gdown==5.2.0
+Pillow==11.2.1
+streamlit==1.40.1
+torch==2.5.1
+torchvision==0.20.1
